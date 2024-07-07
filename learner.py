@@ -3,10 +3,10 @@ from typing import Dict
 import logging
 import torch
 from torch import optim
-
+from torch.utils.tensorboard import SummaryWriter
 from datasets import TemporalDataset
 from optimizers import TKBCOptimizer
-from models import TeLM
+from models import TeLM, KGEnPred
 from regularizers import N3,  La3
 import os
 
@@ -17,11 +17,11 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     '--dataset', type=str,
     help="Dataset name",
-    default='fujian'
+    default='fujian10w'
 )
 
 parser.add_argument(
-    '--model', default='TeLM', type=str,
+    '--model', default='KGEnPred', type=str,
     help="Model Name"
 )
 parser.add_argument(
@@ -29,7 +29,7 @@ parser.add_argument(
     help="Number of epochs."
 )
 parser.add_argument(
-    '--valid_freq', default=1, type=int,
+    '--valid_freq', default=3, type=int,
     help="Number of epochs between each valid."
 )
 parser.add_argument(
@@ -41,7 +41,7 @@ parser.add_argument(
     help="Batch size."
 )
 parser.add_argument(
-    '--learning_rate', default=1e-1, type=float,
+    '--learning_rate', default=1e-2, type=float,
     help="Learning rate"
 )
 parser.add_argument(
@@ -60,6 +60,10 @@ parser.add_argument(
     '--time_granularity', default=1, type=int, 
     help="Time granularity for time embeddings"
 )
+parser.add_argument(
+    '--logs_path', default="./logs", type=str, 
+    help="logs path"
+)
 
 
 args = parser.parse_args()
@@ -71,11 +75,20 @@ def avg_both(mrrs: Dict[str, float], hits: Dict[str, torch.FloatTensor]):
             :param hits:
             :return:
             """
-            m = (mrrs['lhs'] + mrrs['rhs']) / 2.
-            h = (hits['lhs'] + hits['rhs']) / 2.
-            print({'MRR': {'lhs': mrrs['lhs'], 'rhs': mrrs['rhs']}, 'hits@[1,3,10]': {'lhs': hits['lhs'], 'rhs': hits['rhs']}})
+            if 'lhs' in mrrs and 'rhs' in mrrs:
+                m = (mrrs['lhs'] + mrrs['rhs']) / 2.
+                h = (hits['lhs'] + hits['rhs']) / 2.
+                res = {'MRR': {'avg': m, 'lhs': mrrs['lhs'], 'rhs': mrrs['rhs']}, 'hits@[1,3,10]': {'avg': h,'lhs': hits['lhs'], 'rhs': hits['rhs']}}
+            elif 'lhs' in mrrs:
+                m = mrrs['lhs']
+                h = hits['lhs']
+                res = {'MRR': {'avg': m, 'lhs': m}, 'hits@[1,3,10]': {'avg': h, 'lhs': h}}
+            elif 'rhs' in mrrs:
+                m = mrrs['rhs']
+                h = hits['rhs']
+                res = {'MRR': {'avg': m, 'rhs': m}, 'hits@[1,3,10]': {'avg': h, 'rhs': h}}
 
-            return {'MRR': m, 'hits@[1,3,10]': h}
+            return res
 
 def learn(model=args.model,
           dataset=args.dataset,
@@ -99,7 +112,8 @@ def learn(model=args.model,
     
     sizes = dataset.get_shape()
     model = {
-        'TeLM': TeLM(sizes, rank, no_time_emb=args.no_time_emb, time_granularity=time_granularity)
+        'TeLM': TeLM(sizes, rank, no_time_emb=args.no_time_emb, time_granularity=time_granularity),
+        'KGEnPred': KGEnPred(sizes, rank, no_time_emb=args.no_time_emb, time_granularity=time_granularity)
     }[model]
     model = model.cuda()
 
@@ -122,11 +136,14 @@ def learn(model=args.model,
     mrr_std = 0
 
     curve = {'train': [], 'valid': [], 'test': []}
-
+    if not os.path.exists(args.logs_path):
+        os.makedirs(args.logs_path)
+    writer =  SummaryWriter(args.logs_path)
+    global_steps = 0
     for epoch in range(args.max_epochs):
         print("[ Epoch:", epoch, "]")
         examples = torch.from_numpy(
-            dataset.get_train().astype('int64')
+            dataset.get_train()
         )
 
         model.train()
@@ -136,28 +153,23 @@ def learn(model=args.model,
             batch_size=batch_size
         )
         
-        optimizer.epoch(examples)
+        optimizer.epoch(examples, writer, global_steps)
+        
+        # for name, parms in optimizer.model.named_parameters():
+        #     writer.add_histogram(name, parms.data.flatten(), epoch)
+        
+        # writer.add_histogram("enity_emb", optimizer.model.enity_emb_tmp[:1000], epoch)
         
         if epoch < 0 or (epoch + 1) % args.valid_freq == 0:
-
-            if dataset.interval: #for datasets involving time intervals, no eval() for training data
-                valid, test = [
-                    # avg_both(*dataset.eval(model, split, -1, use_left_queries=args.use_left))
-                    avg_both(*dataset.eval(model, split, -1))
-                    for split in ['valid', 'test']
-                ]
-                print("valid: ", valid['MRR'])
-                print("test: ", test['MRR'])
-
-            else:
-                valid, test, train = [
-                    # avg_both(*dataset.eval(model, split, -1 if split != 'train' else 50000, use_left_queries=args.use_left))
-                    avg_both(*dataset.eval(model, split, -1 if split != 'train' else 50000))
-                    for split in ['valid', 'test', 'train']
-                ]
-                print("valid: ", valid['MRR'])
-                print("test: ", test['MRR'])
-                print("train: ", train['MRR'])
+ 
+            valid, test, train = [
+                # avg_both(*dataset.eval(model, split, -1 if split != 'train' else 50000, use_left_queries=args.use_left))
+                avg_both(*dataset.eval(model, split, -1 if split != 'train' else 50000, missing_eval = "rhs"))
+                for split in ['valid', 'test', 'train']
+            ]
+            print("valid: ", valid['MRR'])
+            print("test: ", test['MRR'])
+            print("train: ", train['MRR'])
 
             # Save results
 
@@ -166,7 +178,7 @@ def learn(model=args.model,
             f.write(str(valid))
             f.close()
             # early-stop with patience
-            mrr_valid = valid['MRR']
+            mrr_valid = valid['MRR']['avg']
             if mrr_valid < mrr_std:
                patience += 1
                if patience >= 10:
@@ -194,7 +206,5 @@ def learn(model=args.model,
     f.close()
 
 if __name__ == '__main__':
-    #nohup python -u learner.py --dataset fujian --model TeLM --rank 1000 --learning_rate 0.1 --batch_size 1000 --emb_reg 0.0075 --time_reg 0.01 --time_granularity 1 > fujian_TeLM.log 2>&1 &
+    #nohup python -u learner.py --dataset fujianV2 > fujianv2_KGEnPred.log 2>&1 &
     learn()
-
-
